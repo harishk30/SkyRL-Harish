@@ -645,7 +645,14 @@ def initialize_ray(cfg: DictConfig):
     from .ppo_utils import sync_registries
 
     env_vars = prepare_runtime_environment(cfg)
-    ray.init(runtime_env={"env_vars": env_vars})
+
+    # On clusters without PyPI access, runtime_env packaging can hang/fail.
+    # Allow opting out entirely so workers inherit env vars from raylet.
+    if os.environ.get("SKYRL_DISABLE_RAY_RUNTIME_ENV") == "1":
+        ray.init()
+    else:
+        # Avoid Ray runtime env eager installs on clusters without PyPI access.
+        ray.init(runtime_env={"env_vars": env_vars, "config": {"eager_install": False}})
 
     # create the named ray actors for the registries to make available to all workers
     sync_registries()
