@@ -187,6 +187,7 @@ class PolicyConfig(BaseConfig):
     fsdp_config: FSDPConfig = field(default_factory=FSDPConfig)
     sequence_parallel_size: int = 1
     use_torch_compile: bool = False
+    use_liger_kernel: bool = False
     record_memory: bool = False
     megatron_config: MegatronConfig = field(default_factory=MegatronConfig)
     model_config_kwargs: dict = field(default_factory=dict)
@@ -207,6 +208,7 @@ class RefConfig(BaseConfig):
     model: ModelConfig = field(default_factory=lambda: copy.deepcopy(ModelConfig(path="Qwen/Qwen2.5-1.5B-Instruct")))
     sequence_parallel_size: int = 1
     fsdp_config: FSDPConfig = field(default_factory=FSDPConfig)
+    use_liger_kernel: bool = False
     megatron_config: MegatronConfig = field(default_factory=MegatronConfig)
     model_config_kwargs: dict = field(default_factory=dict)
 

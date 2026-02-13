@@ -36,3 +36,8 @@ register(
     id="searchcode",
     entry_point="skyrl_gym.envs.searchcode.env:SearchCodeEnv",
 )
+
+register(
+    id="citation_prediction",
+    entry_point="skyrl_gym.envs.citation_prediction.env:CitationPredictionEnv",
+)

@@ -32,6 +32,7 @@ docs/_spelling/
 /skyrl-gym/.env 
 
 /skyrl_train/.venv
+/skyrl-train/.venv
 /skyrl-gym/.venv
 
 # build
@@ -47,3 +48,13 @@ tensorboard_log/
 
 # uv lock files
 uv.lock
+
+# Gradio
+.gradio/
+
+# Claude / Minion session files
+.claude/
+.minion-*.json
+
+# Logs in example dirs
+skyrl-train/logs/
