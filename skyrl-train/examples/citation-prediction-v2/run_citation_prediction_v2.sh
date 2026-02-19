@@ -1,16 +1,16 @@
 set -x
 
-# Colocated GRPO training+generation for Qwen2.5-Coder-3B-Instruct on Citation Prediction data.
-# follow the instructions in examples/citation_prediction/README.md for setting up the dataset
-# and for starting the local search server
+# Colocated GRPO training+generation for Qwen3-4B on Citation Prediction v2 (recall task).
+# Task: Given title, intro, and a Related Work subsection heading, predict all citations.
+# Reward: recall with 2x spam penalty.
+#
 # export WANDB_API_KEY=<your_key_here>
-# bash examples/citation_prediction/run_citation_prediction.sh
+# bash examples/citation-prediction-v2/run_citation_prediction_v2.sh
 
-# path for dataset (.parquet files) containing the prompts and metadata for each question
-DATA_DIR="$HOME/data/citation_prediction"
-PROMPT_STYLE=${PROMPT_STYLE:-"short"}   # "short" or "extended"
+DATA_DIR="$HOME/data/citation_prediction_v2"
+PROMPT_STYLE=${PROMPT_STYLE:-"short"}
 
-RUN_NAME="skyrl-citation-prediction_qwen3-4b_${PROMPT_STYLE}_4turns_maxgeneratelen_500-multiturn-sync-TIS_2.0"
+RUN_NAME="skyrl-citation-prediction-v2_qwen3-4b_${PROMPT_STYLE}_15turns_maxgeneratelen_1024-multiturn-sync-TIS_2.0"
 
 TIS_TYPE=token
 TIS_IMP_RATIO_CAP=2.0
@@ -48,24 +48,25 @@ uv run --isolated --frozen --extra vllm -m skyrl_train.entrypoints.main_base \
   trainer.policy_mini_batch_size=256 \
   trainer.micro_forward_batch_size_per_gpu=4 \
   trainer.micro_train_batch_size_per_gpu=4 \
-  trainer.max_prompt_length=2048 \
-  generator.max_input_length=8192 \
-  generator.sampling_params.max_generate_length=500 \
+  trainer.max_prompt_length=4096 \
+  generator.max_input_length=32768 \
+  generator.sampling_params.max_generate_length=1024 \
   generator.async_engine=true \
   generator.batched=false \
   generator.use_conversation_multi_turn=false \
-  generator.n_samples_per_prompt=5 \
-  generator.max_turns=4 \
+  generator.n_samples_per_prompt=10 \
+  generator.max_turns=15 \
   generator.sampling_params.temperature=1.0 \
   generator.sampling_params.top_p=1.0 \
-  generator.sampling_params.stop='["</search>", "</answer>"]' \
-  environment.env_class="citation_prediction" \
+  generator.sampling_params.stop='["</search>", "</done>"]' \
+  environment.env_class="citation_prediction_v2" \
   environment.skyrl_gym.max_env_workers=16 \
-  environment.skyrl_gym.citation_prediction.log_requests=false \
-  environment.skyrl_gym.citation_prediction.search_url="http://127.0.0.1:8000/retrieve" \
-  environment.skyrl_gym.citation_prediction.topk=3 \
+  environment.skyrl_gym.citation_prediction_v2.log_requests=false \
+  environment.skyrl_gym.citation_prediction_v2.search_url="http://127.0.0.1:8000/retrieve" \
+  environment.skyrl_gym.citation_prediction_v2.topk=3 \
+  environment.skyrl_gym.citation_prediction_v2.max_predictions_ratio=2.0 \
   trainer.logger="wandb" \
-  trainer.project_name="skyrl-citation-prediction" \
+  trainer.project_name="skyrl-citation-prediction-v2" \
   trainer.run_name="${RUN_NAME}" \
   trainer.ckpt_interval=20 \
   trainer.hf_save_interval=100 \
@@ -75,7 +76,7 @@ uv run --isolated --frozen --extra vllm -m skyrl_train.entrypoints.main_base \
   trainer.eval_batch_size=256 \
   trainer.eval_before_train=false \
   generator.eval_sampling_params.temperature=0 \
-  generator.eval_sampling_params.stop='["</search>", "</answer>"]' \
+  generator.eval_sampling_params.stop='["</search>", "</done>"]' \
   trainer.export_path="$HOME/${RUN_NAME}/exports" \
   trainer.eval_interval=50 \
   $@

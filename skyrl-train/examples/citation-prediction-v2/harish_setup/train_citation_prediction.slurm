@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# Citation Prediction Training Script
+# Citation Prediction V2 Training Script (recall-based)
 #
 # Usage:
 #   sbatch train_citation_prediction.slurm
@@ -12,9 +12,9 @@
 #   Node 2: Training worker (4 GPUs)
 # ============================================================================
 
-#SBATCH --job-name=citation-prediction
-#SBATCH --output=/scratch/gpfs/ZHUANGL/hk4638/logs/citation-prediction_%j.out
-#SBATCH --error=/scratch/gpfs/ZHUANGL/hk4638/logs/citation-prediction_%j.err
+#SBATCH --job-name=citation-prediction-v2
+#SBATCH --output=/scratch/gpfs/ZHUANGL/hk4638/logs/citation-prediction-v2_%j.out
+#SBATCH --error=/scratch/gpfs/ZHUANGL/hk4638/logs/citation-prediction-v2_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=hk4638@princeton.edu
 #SBATCH --nodes=3
@@ -31,12 +31,12 @@ set -e
 # CONFIGURATION
 # ============================================================================
 SCRATCH_BASE="/scratch/gpfs/ZHUANGL/hk4638"
-DATA_DIR="${SCRATCH_BASE}/data/citation_prediction"
+DATA_DIR="${SCRATCH_BASE}/data/citation_prediction_v2"
 CKPT_DIR="${SCRATCH_BASE}/checkpoints"
 LOG_DIR="${SCRATCH_BASE}/logs"
-PROMPT_STYLE=${PROMPT_STYLE:-"short"}   # "short" or "extended"
+PROMPT_STYLE=${PROMPT_STYLE:-"short"}
 
-RUN_NAME="citation-prediction-${PROMPT_STYLE}-$(date +%Y%m%d-%H%M%S)"
+RUN_NAME="citation-prediction-v2-${PROMPT_STYLE}-$(date +%Y%m%d-%H%M%S)"
 
 mkdir -p "${CKPT_DIR}/${RUN_NAME}"
 mkdir -p "${LOG_DIR}"
@@ -113,11 +113,12 @@ echo "NO_PROXY set to: $NO_PROXY"
 # ============================================================================
 # Embedding model toggle
 EMBEDDING_MODEL=${EMBEDDING_MODEL:-"qwen3_4b"}
-CORPUS_FILE="${DATA_DIR}/arxiv_wikiformat_with_ids.jsonl"
+# Corpus and index are shared with v1
+CORPUS_FILE="${SCRATCH_BASE}/data/citation_prediction/arxiv_wikiformat_with_ids.jsonl"
 
 if [ "$EMBEDDING_MODEL" = "qwen3_4b" ]; then
     RETRIEVER_MODEL_PATH="${SCRATCH_BASE}/huggingface/hub/models--Qwen--Qwen3-Embedding-4B/snapshots/5cf2132abc99cad020ac570b19d031efec650f2b"
-    INDEX_FILE="${DATA_DIR}/qwen3_4b_embed/qwen3_Flat.index"
+    INDEX_FILE="${SCRATCH_BASE}/data/citation_prediction/qwen3_4b_embed/qwen3_Flat.index"
     RETRIEVER_NAME=qwen3
 elif [ "$EMBEDDING_MODEL" = "qwen3_06b" ]; then
     RETRIEVER_MODEL_PATH="${SCRATCH_BASE}/huggingface/hub/models--Qwen--Qwen3-Embedding-0.6B/snapshots/c54f2e6e80b2d7b7de06f51cec4959f6b3e03418"
@@ -280,24 +281,25 @@ uv run --active --frozen --extra vllm -m skyrl_train.entrypoints.main_base \
     trainer.policy_mini_batch_size=256 \
     trainer.micro_forward_batch_size_per_gpu=4 \
     trainer.micro_train_batch_size_per_gpu=4 \
-    trainer.max_prompt_length=2048 \
-    generator.max_input_length=8192 \
-    generator.sampling_params.max_generate_length=500 \
+    trainer.max_prompt_length=4096 \
+    generator.max_input_length=32768 \
+    generator.sampling_params.max_generate_length=1024 \
     generator.async_engine=true \
     generator.batched=false \
     generator.use_conversation_multi_turn=false \
-    generator.n_samples_per_prompt=5 \
-    generator.max_turns=4 \
+    generator.n_samples_per_prompt=10 \
+    generator.max_turns=15 \
     generator.sampling_params.temperature=1.0 \
     generator.sampling_params.top_p=1.0 \
-    generator.sampling_params.stop='["</search>", "</answer>"]' \
-    environment.env_class="citation_prediction" \
+    generator.sampling_params.stop='["</search>", "</done>"]' \
+    environment.env_class="citation_prediction_v2" \
     environment.skyrl_gym.max_env_workers=16 \
-    environment.skyrl_gym.citation_prediction.log_requests=false \
-    environment.skyrl_gym.citation_prediction.search_url="${RETRIEVER_URL}" \
-    environment.skyrl_gym.citation_prediction.topk=3 \
+    environment.skyrl_gym.citation_prediction_v2.log_requests=false \
+    environment.skyrl_gym.citation_prediction_v2.search_url="${RETRIEVER_URL}" \
+    environment.skyrl_gym.citation_prediction_v2.topk=3 \
+    environment.skyrl_gym.citation_prediction_v2.max_predictions_ratio=2.0 \
     trainer.logger="wandb" \
-    trainer.project_name="skyrl-citation-prediction" \
+    trainer.project_name="skyrl-citation-prediction-v2" \
     trainer.run_name="${RUN_NAME}" \
     trainer.ckpt_interval=20 \
     trainer.hf_save_interval=100 \
@@ -307,7 +309,7 @@ uv run --active --frozen --extra vllm -m skyrl_train.entrypoints.main_base \
     trainer.eval_batch_size=256 \
     trainer.eval_before_train=false \
     generator.eval_sampling_params.temperature=0 \
-    generator.eval_sampling_params.stop='["</search>", "</answer>"]' \
+    generator.eval_sampling_params.stop='["</search>", "</done>"]' \
     trainer.export_path="${CKPT_DIR}/${RUN_NAME}/exports" \
     trainer.eval_interval=50
 

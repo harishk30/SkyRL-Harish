@@ -20,3 +20,10 @@ citation_prediction:
   search_url: "http://127.0.0.1:8000/retrieve"
   topk: 3
   timeout: 30
+
+citation_prediction_v2:
+  log_requests: false
+  search_url: "http://127.0.0.1:8000/retrieve"
+  topk: 3
+  timeout: 30
+  max_predictions_ratio: 2.0

@@ -1,5 +1,5 @@
 from skyrl_gym.envs.base_text_env import BaseTextEnv, BaseTextEnvStepOutput, ConversationType
-from skyrl_gym.envs.citation_prediction.utils import compute_arxiv_score
+from skyrl_gym.envs.citation_prediction_v2.utils import extract_all_citations, compute_recall_reward, normalize_arxiv_id
 from skyrl_gym.tools.search import call_search_api, SearchToolGroup
 from typing import Any, Dict, List, Optional, Union
 from dataclasses import dataclass
@@ -12,31 +12,30 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class CitationPredictionEnvConfig:
+class CitationPredictionV2EnvConfig:
     log_requests: bool = False
     search_url: str = "http://127.0.0.1:8000/retrieve"
     topk: int = 3
     timeout: int = 30
+    max_predictions_ratio: float = 2.0
 
 
-class CitationPredictionEnv(BaseTextEnv):
+class CitationPredictionV2Env(BaseTextEnv):
     """
-    Environment for citation prediction tasks.
+    Environment for citation prediction v2: predict ALL citations in a
+    Related Work subsection.
 
-    The model searches over an arxiv corpus to identify a masked citation,
-    then submits its answer using <answer>arxiv_id</answer> tags.
-    Reward = 1.0 if the answer matches the ground-truth arxiv ID (via
-    compute_score exact match), 0.0 otherwise.
+    The model searches over an arxiv corpus and submits citations using
+    <citation>id1, id2, ...</citation> tags. When done, it writes <done></done>.
 
-    A turn counter is appended to each observation so the model knows how
-    many search attempts remain.  On the last turn the model is instructed
-    to submit its answer.
+    Reward = recall with spam penalty:
+      - recall = |predicted & ground_truth| / |ground_truth|
+      - reward = 0 if |predicted| > 2 * |ground_truth| (spam penalty)
 
-    Unlike SearchEnv, this environment also tracks whether the correct
-    paper appeared in any retrieval result (for metrics only).
+    Stop strings: ["</search>", "</done>"]
     """
 
-    def __init__(self, env_config: Union[CitationPredictionEnvConfig, DictConfig, dict], extras: Dict[str, Any] = {}):
+    def __init__(self, env_config: Union[CitationPredictionV2EnvConfig, DictConfig, dict], extras: Dict[str, Any] = {}):
         super().__init__()
 
         assert "reward_spec" in extras, "reward_spec field is required"
@@ -44,22 +43,21 @@ class CitationPredictionEnv(BaseTextEnv):
         if isinstance(reward_spec, str):
             reward_spec = json.loads(reward_spec)
         assert "ground_truth" in reward_spec, "ground_truth is required in reward_spec field"
-        # Store as dict {"target": arxiv_id} for compatibility with compute_score
-        self.ground_truth = reward_spec["ground_truth"]
-        self.ground_truth_id = self.ground_truth["target"]
-        self.max_turns = extras["max_turns"] if "max_turns" in extras else 4
 
-        # Convert plain dict to dataclass for uniform attribute access
+        self.ground_truth = reward_spec["ground_truth"]
+        self.ground_truth_ids = self.ground_truth["targets"]  # list of arxiv IDs
+        self.max_turns = extras.get("max_turns", 15)
+        self.citation_budget = int(len(self.ground_truth_ids) * 2)  # 2x ground truth
+
         if isinstance(env_config, dict):
-            env_config = CitationPredictionEnvConfig(**env_config)
+            env_config = CitationPredictionV2EnvConfig(**env_config)
 
         self.search_url = env_config.search_url
         self.topk = env_config.topk
         self.timeout = env_config.timeout
         self.log_requests = env_config.log_requests
+        self.max_predictions_ratio = env_config.max_predictions_ratio
 
-        # We still register a SearchToolGroup so BaseTextEnv's tool infra is happy,
-        # but we call the retriever API directly in _do_search() to access structured results.
         self.tool_group = SearchToolGroup(
             search_url=self.search_url,
             topk=self.topk,
@@ -68,10 +66,6 @@ class CitationPredictionEnv(BaseTextEnv):
         )
         self.init_tool_groups([self.tool_group])
 
-        # Track whether the correct paper has been found in any retrieval
-        self.found_correct_paper = False
-
-        # Chat history
         self.chat_history: ConversationType = []
 
     def _parse_action(self, action: str) -> List[Optional[str]]:
@@ -81,7 +75,7 @@ class CitationPredictionEnv(BaseTextEnv):
         return [match.group(1)] if match else [None]
 
     def _do_search(self, query: str) -> str:
-        """Call retriever API, check document IDs for reward, return formatted text for model."""
+        """Call retriever API and return formatted text for model."""
         api_response, error_msg = call_search_api(
             retrieval_service_url=self.search_url,
             query=query,
@@ -98,14 +92,6 @@ class CitationPredictionEnv(BaseTextEnv):
         if not raw_results:
             return "\n<information>" + json.dumps({"result": "No search results found."}) + "</information>\n"
 
-        # Check document IDs from the structured response
-        for retrieval in raw_results:
-            for doc_item in retrieval:
-                doc_id = doc_item.get("document", {}).get("id", "")
-                if doc_id == self.ground_truth_id:
-                    self.found_correct_paper = True
-
-        # Format text for the model (same as _passages2string)
         pretty_parts = []
         for retrieval in raw_results:
             formatted = ""
@@ -120,16 +106,20 @@ class CitationPredictionEnv(BaseTextEnv):
     def _is_done(self, action: str) -> bool:
         if self.turns >= self.max_turns:
             return True
-        return "<answer>" in action and "</answer>" in action
+        return "<done>" in action
 
     def _get_reward(self, action: str, done: bool) -> float:
         if done:
             chat_history_str = "".join([item["content"] for item in self.chat_history])
-            return compute_arxiv_score(chat_history_str, self.ground_truth)
+            return compute_recall_reward(
+                chat_history_str,
+                self.ground_truth_ids,
+                max_ratio=self.max_predictions_ratio,
+            )
         return 0.0
 
     def _validate_action(self, action: str):
-        stop_tags = ["</search>", "</answer>"]
+        stop_tags = ["</search>", "</done>"]
         for tag in stop_tags:
             if tag in action:
                 assert action.split(tag, 1)[1] == "", (
@@ -144,7 +134,6 @@ class CitationPredictionEnv(BaseTextEnv):
 
         error = None
 
-        # Check if done (model answered or max turns reached)
         done = self._is_done(action)
         reward = self._get_reward(action, done)
 
@@ -161,7 +150,6 @@ class CitationPredictionEnv(BaseTextEnv):
                 error = str(e)
                 observation = None
 
-        # Wrap the observation properly as a message
         if observation:
             new_obs = {"role": "user", "content": observation}
         elif error:
@@ -169,12 +157,17 @@ class CitationPredictionEnv(BaseTextEnv):
         else:
             new_obs = None
 
-        # Append turn counter to the observation
+        # Count citations so far and compute remaining budget
+        chat_history_str = "".join([item["content"] for item in self.chat_history])
+        num_cited = len(extract_all_citations(chat_history_str))
+        citations_remaining = max(0, self.citation_budget - num_cited)
+
+        # Turn counter with citation budget
         remaining = self.max_turns - self.turns
         if remaining > 1:
-            turn_msg = f"\n\n{remaining} turns remaining."
+            turn_msg = f"\n\n{remaining} turns remaining. Citations so far: {num_cited}/{self.citation_budget} max. You may cite fewer than the max — only cite papers you are confident belong in this subsection."
         elif remaining == 1:
-            turn_msg = "\n\nThis is your last turn. Submit your final answer now using answer tags. Do not search again."
+            turn_msg = f"\n\nThis is your last turn. Citations so far: {num_cited}/{self.citation_budget} max. Cite any remaining papers and write <done></done>."
         else:
             turn_msg = ""
 
@@ -202,11 +195,22 @@ class CitationPredictionEnv(BaseTextEnv):
         )
 
     def get_metrics(self) -> Dict[str, Any]:
-        # Check if the model explicitly answered with <answer> tags
         chat_history_str = "".join([item["content"] for item in self.chat_history])
-        answered = "<answer>" in chat_history_str and "</answer>" in chat_history_str
+        predicted = extract_all_citations(chat_history_str)
+        gt_set = {normalize_arxiv_id(gid) for gid in self.ground_truth_ids}
+        correct = predicted & gt_set
+
+        recall = len(correct) / len(gt_set) if gt_set else 0.0
+        precision = len(correct) / len(predicted) if predicted else 0.0
+
+        answered = "<done>" in chat_history_str
+
         return {
-            "found_paper": int(self.found_correct_paper),
+            "num_predicted": len(predicted),
+            "num_ground_truth": len(gt_set),
+            "num_correct": len(correct),
+            "recall": recall,
+            "precision": precision,
             "answered": int(answered),
             "num_turns": self.turns,
         }

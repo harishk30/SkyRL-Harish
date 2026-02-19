@@ -1,33 +1,33 @@
 #!/usr/bin/env python3
-"""Evaluate a base model on the citation prediction dataset without RL.
+"""Evaluate a base model on the citation prediction v2 dataset without RL.
 
 Runs multi-turn inference: model generates <search>query</search>,
-retriever returns results, we check if the target arxiv ID appeared.
+retriever returns results, model accumulates <citation> tags throughout.
 
-Supports pass@k evaluation: generate multiple stochastic samples per prompt
-and compute the unbiased pass@k estimator for k=1..num_samples.
+Metrics: recall, precision, num_correct per subsection.
 
-Use this to iterate on prompt templates and embedding models before training.
+Supports multi-sample evaluation: generate multiple stochastic samples per
+prompt and report mean/max recall across samples.
 
 Requires:
   - A retriever server running (see start_retriever.sh)
   - A GPU for vLLM inference
 
 Usage:
-    # Quick greedy test on 20 validation examples
-    python examples/citation_prediction/eval_base_model.py \
+    # Quick greedy test on 20 examples
+    python eval_base_model.py \
         --model Qwen/Qwen3-4B \
         --data /path/to/validation.parquet \
         --search_url http://localhost:8000/retrieve \
         --max_examples 20 --temperature 0
 
-    # Pass@k=20 evaluation on 100 random training examples
-    python examples/citation_prediction/eval_base_model.py \
+    # Multi-sample evaluation on 100 random training examples
+    python eval_base_model.py \
         --model Qwen/Qwen3-4B \
         --data /path/to/train.parquet \
         --search_url http://localhost:8000/retrieve \
         --max_examples 100 --random_sample \
-        --num_samples 20 --temperature 1.0 \
+        --num_samples 10 --temperature 1.0 \
         --output results.json
 """
 
@@ -37,7 +37,6 @@ import json
 import re
 import sys
 import time
-from math import comb
 from pathlib import Path
 
 import pandas as pd
@@ -45,19 +44,82 @@ import requests
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
+# ---------------------------------------------------------------------------
+# Arxiv ID extraction (from retriever results and <citation> tags)
+# ---------------------------------------------------------------------------
+
 ARXIV_ID_RE = re.compile(r"\[arxiv:(\d{4}\.\d{4,5})\]")
+CITATION_TAG_RE = re.compile(r"<citation>(.*?)</citation>", re.DOTALL)
 
 
-def extract_arxiv_ids(text: str) -> set:
-    """Extract arxiv IDs like [arxiv:1706.03762] from text."""
-    return set(ARXIV_ID_RE.findall(text))
+def normalize_arxiv_id(s: str) -> str:
+    """Normalize an arxiv ID to YYMM.NNNNN format."""
+    s = s.strip()
+    match = re.search(r"(\d{4}\.\d{4,5})", s)
+    if match:
+        return match.group(1)
+    s = s.strip("[]")
+    s = re.sub(r"^[A-Za-z-]+[:/]\s*", "", s)
+    s = re.sub(r"v\d+$", "", s)
+    return s.strip()
+
+
+def extract_all_citations(text: str) -> set[str]:
+    """Extract all arxiv IDs from <citation> tags in the trajectory."""
+    ids = set()
+    for match in CITATION_TAG_RE.finditer(text):
+        raw = match.group(1)
+        for part in raw.split(","):
+            part = part.strip()
+            if part:
+                normalized = normalize_arxiv_id(part)
+                if normalized and re.match(r"\d{4}\.\d{4,5}$", normalized):
+                    ids.add(normalized)
+    return ids
+
+
+def compute_recall_metrics(
+    messages: list[dict],
+    targets: list[str],
+    max_predictions_ratio: float = 2.0,
+) -> dict:
+    """Compute recall/precision metrics from a completed trajectory."""
+    full_text = "".join(m["content"] for m in messages)
+    predicted = extract_all_citations(full_text)
+    gt_set = {normalize_arxiv_id(t) for t in targets}
+    gt_set.discard("")
+
+    correct = predicted & gt_set
+    num_gt = len(gt_set)
+    num_pred = len(predicted)
+    num_correct = len(correct)
+
+    # Spam penalty
+    if num_pred > max_predictions_ratio * num_gt:
+        recall = 0.0
+    else:
+        recall = num_correct / num_gt if num_gt else 0.0
+
+    precision = num_correct / num_pred if num_pred else 0.0
+
+    return {
+        "recall": recall,
+        "precision": precision,
+        "num_predicted": num_pred,
+        "num_correct": num_correct,
+        "num_ground_truth": num_gt,
+        "predicted_ids": sorted(predicted),
+        "correct_ids": sorted(correct),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Retriever
+# ---------------------------------------------------------------------------
 
 
 def call_retriever(search_url: str, query: str, topk: int = 3, timeout: int = 30) -> str:
-    """Call the retriever API. Returns the same JSON string format as SearchToolGroup.search().
-
-    Output format: '{"result": "Doc 1: [arxiv:1706.03762] ...\\nDoc 2: ..."}'
-    """
+    """Call the retriever API. Returns JSON string matching env format."""
     try:
         resp = requests.post(
             search_url,
@@ -69,7 +131,6 @@ def call_retriever(search_url: str, query: str, topk: int = 3, timeout: int = 30
         data = resp.json()
         raw_results = data.get("result", [])
         if raw_results:
-            # Match _passages2string format from skyrl_gym/tools/search.py
             pretty_parts = []
             for retrieval in raw_results:
                 formatted = ""
@@ -82,6 +143,11 @@ def call_retriever(search_url: str, query: str, topk: int = 3, timeout: int = 30
         return json.dumps({"result": "No search results found."})
     except Exception as e:
         return json.dumps({"result": f"Search error: {e}"})
+
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
 
 
 def load_examples(data_path: str, system_prompt_override: str = None,
@@ -107,85 +173,40 @@ def load_examples(data_path: str, system_prompt_override: str = None,
         reward_spec = row["reward_spec"]
         if isinstance(reward_spec, str):
             reward_spec = json.loads(reward_spec)
-        target = reward_spec["ground_truth"]["target"]
+        targets = reward_spec["ground_truth"]["targets"]  # list of arxiv IDs
+
+        metadata = row.get("metadata", "{}")
+        if isinstance(metadata, str):
+            metadata = json.loads(metadata)
 
         examples.append({
             "messages": list(prompt),
-            "target": target,
+            "targets": targets,
+            "subsection_heading": metadata.get("subsection_heading", ""),
+            "num_ground_truth": len(targets),
         })
     return examples
 
 
-def pass_at_k(n: int, c: int, k: int) -> float:
-    """Unbiased pass@k estimator.
-
-    n = total samples, c = number of correct samples, k = k value.
-    pass@k = 1 - C(n-c, k) / C(n, k)
-    """
-    if n - c < k:
-        return 1.0
-    return 1.0 - comb(n - c, k) / comb(n, k)
-
-
-def run_single_sample(example, llm, tokenizer, sampling_params, args):
-    """Run one multi-turn trajectory for a single example.
-
-    Returns dict with {found, turns, queries, messages}.
-    """
-    messages = copy.deepcopy(example["messages"])
-    target = example["target"]
-    found = False
-    turns = 0
-    queries = []
-
-    for turn in range(args.max_turns):
-        if found:
-            break
-
-        text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
-        )
-        outputs = llm.generate([text], sampling_params)
-        response = outputs[0].outputs[0].text
-        turns += 1
-        messages.append({"role": "assistant", "content": response})
-
-        match = re.search(r"<search>(.*?)</search>", response, re.DOTALL)
-        if match is None:
-            continue
-
-        query = match.group(1).strip()
-        queries.append(query)
-
-        tool_output = call_retriever(args.search_url, query, args.topk)
-        observation = "\n<information>" + tool_output + "</information>\n"
-        messages.append({"role": "user", "content": observation})
-
-        retrieved_ids = extract_arxiv_ids(tool_output)
-        if target in retrieved_ids:
-            found = True
-
-    return {
-        "found": found,
-        "turns": turns,
-        "queries": queries,
-        "messages": messages,
-    }
+# ---------------------------------------------------------------------------
+# Batched multi-turn inference
+# ---------------------------------------------------------------------------
 
 
 def run_batched_single_sample(examples, llm, tokenizer, sampling_params, args):
     """Run one multi-turn trajectory for all examples using batched vLLM generation.
 
-    Returns list of dicts with {found, turns, queries, messages}.
+    Each trajectory runs until max_turns or the model outputs <done>.
+    Returns list of dicts with {recall, precision, num_predicted, num_correct,
+    num_ground_truth, turns, queries, messages}.
     """
     n = len(examples)
-    # Initialize per-example state
     states = []
     for ex in examples:
         states.append({
             "messages": copy.deepcopy(ex["messages"]),
-            "target": ex["target"],
-            "found": False,
+            "targets": ex["targets"],
+            "done": False,
             "turns": 0,
             "queries": [],
         })
@@ -196,9 +217,7 @@ def run_batched_single_sample(examples, llm, tokenizer, sampling_params, args):
         if not active_indices:
             break
 
-        n_active = len(active_indices)
-
-        # 1. Format prompts for all active examples
+        # 1. Format prompts for active examples
         prompts = []
         for idx in active_indices:
             text = tokenizer.apply_chat_template(
@@ -208,7 +227,7 @@ def run_batched_single_sample(examples, llm, tokenizer, sampling_params, args):
             )
             prompts.append(text)
 
-        # 2. Batch generate with vLLM
+        # 2. Batch generate
         outputs = llm.generate(prompts, sampling_params)
 
         # 3. Process results
@@ -219,40 +238,65 @@ def run_batched_single_sample(examples, llm, tokenizer, sampling_params, args):
             st["turns"] += 1
             st["messages"].append({"role": "assistant", "content": response})
 
+            # Check if model signaled done
+            if "<done>" in response:
+                st["done"] = True
+                continue
+
+            # Check for search query
             match = re.search(r"<search>(.*?)</search>", response, re.DOTALL)
             if match is None:
+                # No search and no done — model generated thinking/citations only
                 still_active.append(idx)
                 continue
 
             query = match.group(1).strip()
             st["queries"].append(query)
 
+            # Call retriever
             tool_output = call_retriever(args.search_url, query, args.topk)
             observation = "\n<information>" + tool_output + "</information>\n"
-            st["messages"].append({"role": "user", "content": observation})
 
-            retrieved_ids = extract_arxiv_ids(tool_output)
-            if st["target"] in retrieved_ids:
-                st["found"] = True
-            else:
-                still_active.append(idx)
+            # Add turn counter
+            remaining = args.max_turns - st["turns"]
+            if remaining > 1:
+                observation += f"\n\n{remaining} turns remaining."
+            elif remaining == 1:
+                observation += "\n\nThis is your last turn. Cite remaining papers and write <done></done>."
+
+            st["messages"].append({"role": "user", "content": observation})
+            still_active.append(idx)
 
         active_indices = still_active
 
-    return [
-        {
-            "found": st["found"],
+    # Compute metrics for all examples
+    results = []
+    for st in states:
+        metrics = compute_recall_metrics(st["messages"], st["targets"])
+        results.append({
+            "recall": metrics["recall"],
+            "precision": metrics["precision"],
+            "num_predicted": metrics["num_predicted"],
+            "num_correct": metrics["num_correct"],
+            "num_ground_truth": metrics["num_ground_truth"],
+            "predicted_ids": metrics["predicted_ids"],
+            "correct_ids": metrics["correct_ids"],
+            "done": st["done"],
             "turns": st["turns"],
             "queries": st["queries"],
             "messages": st["messages"],
-        }
-        for st in states
-    ]
+        })
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate base model on citation prediction dataset"
+        description="Evaluate base model on citation prediction v2 (recall)"
     )
     parser.add_argument("--model", type=str, required=True,
                         help="Model path or HuggingFace name")
@@ -262,18 +306,18 @@ def main():
                         default="http://127.0.0.1:8000/retrieve")
     parser.add_argument("--topk", type=int, default=3,
                         help="Number of search results per query (n)")
-    parser.add_argument("--max_turns", type=int, default=4,
+    parser.add_argument("--max_turns", type=int, default=15,
                         help="Max search turns per trajectory (m)")
     parser.add_argument("--max_examples", type=int, default=None,
-                        help="Limit number of examples (for quick testing)")
+                        help="Limit number of examples")
     parser.add_argument("--random_sample", action="store_true",
                         help="Randomly sample examples instead of taking head")
     parser.add_argument("--num_samples", type=int, default=1,
-                        help="Number of stochastic samples per prompt for pass@k")
-    parser.add_argument("--max_tokens", type=int, default=500,
+                        help="Number of stochastic samples per prompt")
+    parser.add_argument("--max_tokens", type=int, default=1024,
                         help="Max tokens per generation turn")
     parser.add_argument("--temperature", type=float, default=1.0,
-                        help="Sampling temperature (0 = greedy, 1.0 for pass@k)")
+                        help="Sampling temperature (0 = greedy)")
     parser.add_argument("--system_prompt", type=str, default=None,
                         help="Override system prompt (direct text)")
     parser.add_argument("--system_prompt_file", type=str, default=None,
@@ -311,14 +355,6 @@ def main():
         seed=args.seed,
     )
 
-    sampling_params = SamplingParams(
-        temperature=args.temperature,
-        max_tokens=args.max_tokens,
-        stop=["</search>"],
-        include_stop_str_in_output=True,
-        seed=args.seed,
-    )
-
     # ----------------------------------------------------------------
     # Load dataset
     # ----------------------------------------------------------------
@@ -330,10 +366,15 @@ def main():
     print(f"Loaded {len(examples)} examples")
     print(f"\nSystem prompt:\n  {examples[0]['messages'][0]['content'][:200]}...\n")
 
+    # Print ground truth distribution
+    gt_counts = [ex["num_ground_truth"] for ex in examples]
+    print(f"Ground truth citations per example: min={min(gt_counts)}, "
+          f"max={max(gt_counts)}, mean={sum(gt_counts)/len(gt_counts):.1f}")
+
     # ----------------------------------------------------------------
     # Verify retriever
     # ----------------------------------------------------------------
-    print(f"Checking retriever at {args.search_url}...")
+    print(f"\nChecking retriever at {args.search_url}...")
     try:
         resp = requests.post(
             args.search_url,
@@ -363,17 +404,15 @@ def main():
     for sample_idx in range(num_samples):
         sample_start = time.time()
 
-        # Use different seed per sample for stochastic diversity
         sample_seed = args.seed + sample_idx
         sample_params = SamplingParams(
             temperature=args.temperature,
             max_tokens=args.max_tokens,
-            stop=["</search>"],
+            stop=["</search>", "</done>"],
             include_stop_str_in_output=True,
             seed=sample_seed,
         )
 
-        # Use batched generation for efficiency
         sample_results = run_batched_single_sample(
             examples, llm, tokenizer, sample_params, args,
         )
@@ -381,32 +420,40 @@ def main():
         for i, result in enumerate(sample_results):
             per_example_samples[i].append(result)
 
-        sample_found = sum(1 for r in sample_results if r["found"])
+        # Per-sample summary
+        recalls = [r["recall"] for r in sample_results]
+        mean_recall = sum(recalls) / len(recalls)
+        nonzero_recall = sum(1 for r in recalls if r > 0)
         sample_time = time.time() - sample_start
         print(f"  Sample {sample_idx + 1}/{num_samples}: "
-              f"{sample_found}/{total_examples} found ({sample_found/total_examples*100:.1f}%) "
+              f"mean_recall={mean_recall*100:.1f}%, "
+              f"nonzero={nonzero_recall}/{total_examples} "
+              f"({nonzero_recall/total_examples*100:.1f}%) "
               f"in {sample_time:.1f}s")
 
     elapsed = time.time() - start_time
 
     # ----------------------------------------------------------------
-    # Compute pass@k
+    # Aggregate metrics
     # ----------------------------------------------------------------
-    k_values = sorted(set(
-        k for k in [1, 2, 3, 5, 10, 15, 20] if k <= num_samples
-    ))
 
-    # Per-example: count how many samples found the target
-    per_example_correct = []
+    # Per-example: best recall across samples, mean recall
+    per_example_best_recall = []
+    per_example_mean_recall = []
+    per_example_best_precision = []
     for i in range(total_examples):
-        c = sum(1 for s in per_example_samples[i] if s["found"])
-        per_example_correct.append(c)
+        recalls = [s["recall"] for s in per_example_samples[i]]
+        precisions = [s["precision"] for s in per_example_samples[i]]
+        per_example_best_recall.append(max(recalls))
+        per_example_mean_recall.append(sum(recalls) / len(recalls))
+        per_example_best_precision.append(max(precisions))
 
-    # Compute pass@k for each k
-    pass_at_k_results = {}
-    for k in k_values:
-        scores = [pass_at_k(num_samples, c, k) for c in per_example_correct]
-        pass_at_k_results[k] = sum(scores) / len(scores)
+    mean_best_recall = sum(per_example_best_recall) / total_examples
+    mean_mean_recall = sum(per_example_mean_recall) / total_examples
+    mean_best_precision = sum(per_example_best_precision) / total_examples
+
+    # Fraction of examples where at least one sample got nonzero recall
+    any_correct = sum(1 for r in per_example_best_recall if r > 0)
 
     # ----------------------------------------------------------------
     # Summary
@@ -414,41 +461,53 @@ def main():
     print(f"\n{'=' * 60}")
     print(f"RESULTS")
     print(f"{'=' * 60}")
-    print(f"Examples:           {total_examples}")
-    print(f"Samples/prompt:     {num_samples}")
-    print(f"Temperature:        {args.temperature}")
-    print(f"Max turns (m):      {args.max_turns}")
-    print(f"Top-k (n):          {args.topk}")
-    print(f"Total time:         {elapsed:.1f}s")
+    print(f"Examples:                  {total_examples}")
+    print(f"Samples/prompt:            {num_samples}")
+    print(f"Temperature:               {args.temperature}")
+    print(f"Max turns (m):             {args.max_turns}")
+    print(f"Top-k (n):                 {args.topk}")
+    print(f"Total time:                {elapsed:.1f}s")
     print(f"{'=' * 60}")
 
-    print(f"\nPass@k results:")
-    for k, rate in sorted(pass_at_k_results.items()):
-        print(f"  pass@{k:>2d}: {rate*100:.1f}%")
+    print(f"\nRecall metrics:")
+    print(f"  Mean recall (all samples):     {mean_mean_recall*100:.1f}%")
+    print(f"  Mean best recall (per example):{mean_best_recall*100:.1f}%")
+    print(f"  Any correct (>0 recall):       {any_correct}/{total_examples} "
+          f"({any_correct/total_examples*100:.1f}%)")
+    print(f"  Mean best precision:           {mean_best_precision*100:.1f}%")
 
-    # Per-turn breakdown (across all samples)
-    all_sample_turns_found = []
-    for i in range(total_examples):
-        for s in per_example_samples[i]:
-            if s["found"]:
-                all_sample_turns_found.append(s["turns"])
+    # Recall distribution (best per example)
+    print(f"\nRecall distribution (best per example):")
+    bins = [(0, 0), (0.01, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.0), (1.0, 1.01)]
+    labels = ["0%", "1-25%", "25-50%", "50-75%", "75-99%", "100%"]
+    for (lo, hi), label in zip(bins, labels):
+        count = sum(1 for r in per_example_best_recall if lo <= r < hi)
+        if label == "100%":
+            count = sum(1 for r in per_example_best_recall if r >= 1.0)
+        print(f"  {label:>8s}: {count:>4d} ({count/total_examples*100:.1f}%)")
 
-    if all_sample_turns_found:
-        avg_turns_found = sum(all_sample_turns_found) / len(all_sample_turns_found)
-        print(f"\nAvg turns (when found): {avg_turns_found:.2f}")
+    # Turn usage
+    all_turns = [s["turns"] for samples in per_example_samples for s in samples]
+    avg_turns = sum(all_turns) / len(all_turns) if all_turns else 0
+    print(f"\nAvg turns: {avg_turns:.1f}")
 
-        turn_counts = {}
-        for t in all_sample_turns_found:
-            turn_counts[t] = turn_counts.get(t, 0) + 1
-        print(f"Per-turn breakdown (found, across all samples):")
-        for t in sorted(turn_counts):
-            print(f"  Turn {t}: {turn_counts[t]}")
+    # Verbose per-example output
+    if args.verbose:
+        print(f"\nPer-example results (best sample):")
+        for i in range(total_examples):
+            best_idx = max(range(num_samples),
+                           key=lambda j: per_example_samples[i][j]["recall"])
+            best = per_example_samples[i][best_idx]
+            print(f"  [{i:>3d}] heading='{examples[i]['subsection_heading'][:50]}' "
+                  f"gt={best['num_ground_truth']} "
+                  f"pred={best['num_predicted']} "
+                  f"correct={best['num_correct']} "
+                  f"recall={best['recall']*100:.0f}%")
 
     # ----------------------------------------------------------------
     # Save detailed results
     # ----------------------------------------------------------------
     if args.output:
-        # Create output directory if needed
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -457,7 +516,14 @@ def main():
             samples_data = []
             for s in per_example_samples[i]:
                 samples_data.append({
-                    "found": s["found"],
+                    "recall": s["recall"],
+                    "precision": s["precision"],
+                    "num_predicted": s["num_predicted"],
+                    "num_correct": s["num_correct"],
+                    "num_ground_truth": s["num_ground_truth"],
+                    "predicted_ids": s["predicted_ids"],
+                    "correct_ids": s["correct_ids"],
+                    "done": s["done"],
                     "turns": s["turns"],
                     "queries": s["queries"],
                     "messages": s["messages"],
@@ -465,8 +531,11 @@ def main():
 
             results.append({
                 "index": i,
-                "target": examples[i]["target"],
-                "num_correct": per_example_correct[i],
+                "targets": examples[i]["targets"],
+                "subsection_heading": examples[i]["subsection_heading"],
+                "num_ground_truth": examples[i]["num_ground_truth"],
+                "best_recall": per_example_best_recall[i],
+                "mean_recall": per_example_mean_recall[i],
                 "samples": samples_data,
             })
 
@@ -486,11 +555,11 @@ def main():
             },
             "summary": {
                 "total": total_examples,
-                "pass_at_k": {str(k): v for k, v in pass_at_k_results.items()},
-                "avg_turns_found": (
-                    sum(all_sample_turns_found) / len(all_sample_turns_found)
-                    if all_sample_turns_found else 0
-                ),
+                "mean_recall_all": mean_mean_recall,
+                "mean_best_recall": mean_best_recall,
+                "mean_best_precision": mean_best_precision,
+                "any_correct_fraction": any_correct / total_examples,
+                "avg_turns": avg_turns,
                 "elapsed_seconds": elapsed,
             },
             "results": results,

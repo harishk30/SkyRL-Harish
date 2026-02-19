@@ -58,3 +58,13 @@ uv.lock
 
 # Logs in example dirs
 skyrl-train/logs/
+
+# Core dumps
+core.*
+
+# Certificates
+*.pem
+
+# Harish setup .env files (contain API keys)
+**/harish_setup/.env
+**/harish_citation/.env

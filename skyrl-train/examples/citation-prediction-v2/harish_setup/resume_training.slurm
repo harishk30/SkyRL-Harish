@@ -1,20 +1,15 @@
 #!/bin/bash
 # ============================================================================
-# Citation Prediction Training Script
+# Citation Prediction RESUME Training Script
 #
-# Usage:
-#   sbatch train_citation_prediction.slurm
-#   PROMPT_STYLE=extended sbatch train_citation_prediction.slurm
+# Usage: sbatch --export=RESUME_RUN="citation-prediction-YYYYMMDD-HHMMSS" resume_training.slurm
 #
-# 3 nodes × 4 GPUs = 12 GPUs:
-#   Node 0: Retriever (4 GPUs for FAISS sharding)
-#   Node 1: Training head (4 GPUs)
-#   Node 2: Training worker (4 GPUs)
+# This script resumes training from the latest checkpoint of a previous run.
 # ============================================================================
 
-#SBATCH --job-name=citation-prediction
-#SBATCH --output=/scratch/gpfs/ZHUANGL/hk4638/logs/citation-prediction_%j.out
-#SBATCH --error=/scratch/gpfs/ZHUANGL/hk4638/logs/citation-prediction_%j.err
+#SBATCH --job-name=citation-prediction-resume
+#SBATCH --output=/scratch/gpfs/ZHUANGL/hk4638/logs/citation-prediction-resume_%j.out
+#SBATCH --error=/scratch/gpfs/ZHUANGL/hk4638/logs/citation-prediction-resume_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=hk4638@princeton.edu
 #SBATCH --nodes=3
@@ -28,6 +23,21 @@
 set -e
 
 # ============================================================================
+# RESUME CONFIGURATION - REQUIRED
+# ============================================================================
+if [ -z "${RESUME_RUN}" ]; then
+    echo "ERROR: RESUME_RUN is not set!"
+    echo "Usage: sbatch --export=RESUME_RUN=\"citation-prediction-YYYYMMDD-HHMMSS\" resume_training.slurm"
+    echo ""
+    echo "Available runs to resume from:"
+    ls -la /scratch/gpfs/ZHUANGL/hk4638/checkpoints/ | grep citation-prediction
+    exit 1
+fi
+
+RUN_NAME="${RESUME_RUN}"
+echo "=== Resuming training run: ${RUN_NAME} ==="
+
+# ============================================================================
 # CONFIGURATION
 # ============================================================================
 SCRATCH_BASE="/scratch/gpfs/ZHUANGL/hk4638"
@@ -36,10 +46,23 @@ CKPT_DIR="${SCRATCH_BASE}/checkpoints"
 LOG_DIR="${SCRATCH_BASE}/logs"
 PROMPT_STYLE=${PROMPT_STYLE:-"short"}   # "short" or "extended"
 
-RUN_NAME="citation-prediction-${PROMPT_STYLE}-$(date +%Y%m%d-%H%M%S)"
+# Verify checkpoint directory exists
+if [ ! -d "${CKPT_DIR}/${RUN_NAME}" ]; then
+    echo "ERROR: Checkpoint directory not found: ${CKPT_DIR}/${RUN_NAME}"
+    echo "Available runs:"
+    ls -la ${CKPT_DIR}/ | grep citation-prediction
+    exit 1
+fi
 
-mkdir -p "${CKPT_DIR}/${RUN_NAME}"
-mkdir -p "${LOG_DIR}"
+# Show checkpoint status
+echo "Checkpoint directory: ${CKPT_DIR}/${RUN_NAME}"
+if [ -f "${CKPT_DIR}/${RUN_NAME}/latest_ckpt_global_step.txt" ]; then
+    LATEST_STEP=$(cat "${CKPT_DIR}/${RUN_NAME}/latest_ckpt_global_step.txt")
+    echo "Latest checkpoint: global_step_${LATEST_STEP}"
+else
+    echo "WARNING: No latest_ckpt_global_step.txt found, will scan for checkpoints"
+    ls -la "${CKPT_DIR}/${RUN_NAME}/" | grep global_step || echo "No checkpoints found!"
+fi
 
 # ============================================================================
 # ENVIRONMENT SETUP
@@ -66,22 +89,15 @@ export PATH="$HOME/.local/bin:$PATH"
 export VIRTUAL_ENV="/home/hk4638/SkyRL/skyrl-train/.venv"
 
 # Local path to cached model (avoids HuggingFace network requests)
-MODEL_PATH="/scratch/gpfs/ZHUANGL/hk4638/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c"
+MODEL_PATH="/scratch/gpfs/ZHUANGL/hk4638/huggingface/hub/models--Qwen--Qwen2.5-3B-Instruct/snapshots/aa8e72537993ba99e69dfaafa59ed015b17504d1"
 
 # Load proxy for WandB access (api.wandb.ai is on the approved list)
 # Note: PyPI is NOT on the list, so all packages must be pre-installed
 module load proxy/default
 
 # CRITICAL: Disable Ray's automatic uv runtime_env detection
-# Without this, Ray detects uv run, packages the working_dir, and tries to build
-# skyrl-train on workers - which fails because workers can't reach PyPI
-# See: https://github.com/ray-project/ray/issues/59639
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
-
-# Also unset the hook to prevent automatic runtime_env creation
 unset RAY_RUNTIME_ENV_HOOK
-# NOTE: Do NOT set SKYRL_DISABLE_RAY_RUNTIME_ENV=1 - we need runtime_env to pass
-# HF_HOME and other env vars to Ray workers
 
 # Load secrets (hardcoded path - BASH_SOURCE doesn't work reliably in SLURM)
 ENV_FILE="/home/hk4638/SkyRL/skyrl-train/examples/citation_prediction/harish_setup/.env"
@@ -109,29 +125,9 @@ export no_proxy="$NO_PROXY"
 echo "NO_PROXY set to: $NO_PROXY"
 
 # ============================================================================
-# RETRIEVER CONFIGURATION
-# ============================================================================
-# Embedding model toggle
-EMBEDDING_MODEL=${EMBEDDING_MODEL:-"qwen3_4b"}
-CORPUS_FILE="${DATA_DIR}/arxiv_wikiformat_with_ids.jsonl"
-
-if [ "$EMBEDDING_MODEL" = "qwen3_4b" ]; then
-    RETRIEVER_MODEL_PATH="${SCRATCH_BASE}/huggingface/hub/models--Qwen--Qwen3-Embedding-4B/snapshots/5cf2132abc99cad020ac570b19d031efec650f2b"
-    INDEX_FILE="${DATA_DIR}/qwen3_4b_embed/qwen3_Flat.index"
-    RETRIEVER_NAME=qwen3
-elif [ "$EMBEDDING_MODEL" = "qwen3_06b" ]; then
-    RETRIEVER_MODEL_PATH="${SCRATCH_BASE}/huggingface/hub/models--Qwen--Qwen3-Embedding-0.6B/snapshots/c54f2e6e80b2d7b7de06f51cec4959f6b3e03418"
-    INDEX_FILE="/home/hk4638/scratch/shared/data/qwen3_06_embed/qwen3_Flat.index"
-    RETRIEVER_NAME=qwen3
-fi
-
-# ============================================================================
 # START RETRIEVER SERVER
 # ============================================================================
 echo "=== Starting retriever server on ${RETRIEVER_NODE} ==="
-echo "Embedding model: ${EMBEDDING_MODEL}"
-echo "Index: ${INDEX_FILE}"
-echo "Corpus: ${CORPUS_FILE}"
 
 srun --nodes=1 --ntasks=1 --nodelist=${RETRIEVER_NODE} \
     bash -c "
@@ -145,11 +141,11 @@ srun --nodes=1 --ntasks=1 --nodelist=${RETRIEVER_NODE} \
 
         echo 'Starting retriever on \$(hostname) with 4 GPUs for FAISS sharding...'
         python /home/hk4638/SkyRL/skyrl-train/examples/citation_prediction/retriever/retrieval_server.py \
-            --index_path ${INDEX_FILE} \
-            --corpus_path ${CORPUS_FILE} \
+            --index_path ${DATA_DIR}/e5_Flat.index \
+            --corpus_path ${DATA_DIR}/wiki-18.jsonl \
             --topk 3 \
-            --retriever_name ${RETRIEVER_NAME} \
-            --retriever_model ${RETRIEVER_MODEL_PATH} \
+            --retriever_name e5 \
+            --retriever_model intfloat/e5-base-v2 \
             --faiss_gpu
     " > "${LOG_DIR}/retriever_${SLURM_JOB_ID}.log" 2>&1 &
 
@@ -230,14 +226,14 @@ echo "Verifying Ray cluster status..."
 uv run --active --frozen ray status
 
 # ============================================================================
-# RUN TRAINING
+# RUN TRAINING (RESUME MODE)
 # ============================================================================
-echo "=== Starting training ==="
+echo "=== Resuming training ==="
 echo "Run name: ${RUN_NAME}"
-echo "Prompt style: ${PROMPT_STYLE}"
-echo "Data dir: ${DATA_DIR}/${PROMPT_STYLE}"
+echo "Data dir: ${DATA_DIR}"
 echo "Checkpoint dir: ${CKPT_DIR}/${RUN_NAME}"
 echo "Retriever URL: ${RETRIEVER_URL}"
+echo "Resume mode: latest"
 
 # CRITICAL: Set RAY_ADDRESS so training connects to existing cluster instead of starting local
 export RAY_ADDRESS="${HEAD_NODE_IP}:${RAY_PORT}"
@@ -259,9 +255,6 @@ uv run --active --frozen --extra vllm -m skyrl_train.entrypoints.main_base \
     trainer.policy.model.path="${MODEL_PATH}" \
     trainer.placement.colocate_all=true \
     trainer.strategy=fsdp2 \
-    +trainer.policy.use_liger_kernel=true \
-    trainer.policy.sequence_parallel_size=2 \
-    +trainer.ref.use_liger_kernel=true \
     trainer.policy.fsdp_config.cpu_offload=false \
     trainer.ref.fsdp_config.cpu_offload=true \
     trainer.placement.policy_num_gpus_per_node=4 \
@@ -291,14 +284,14 @@ uv run --active --frozen --extra vllm -m skyrl_train.entrypoints.main_base \
     generator.sampling_params.temperature=1.0 \
     generator.sampling_params.top_p=1.0 \
     generator.sampling_params.stop='["</search>", "</answer>"]' \
-    environment.env_class="citation_prediction" \
+    environment.env_class="search" \
     environment.skyrl_gym.max_env_workers=16 \
-    environment.skyrl_gym.citation_prediction.log_requests=false \
-    environment.skyrl_gym.citation_prediction.search_url="${RETRIEVER_URL}" \
-    environment.skyrl_gym.citation_prediction.topk=3 \
+    environment.skyrl_gym.search.log_requests=false \
+    environment.skyrl_gym.search.search_url="${RETRIEVER_URL}" \
+    environment.skyrl_gym.search.topk=3 \
     trainer.logger="wandb" \
     trainer.project_name="skyrl-citation-prediction" \
-    trainer.run_name="${RUN_NAME}" \
+    trainer.run_name="${RUN_NAME}-resumed" \
     trainer.ckpt_interval=20 \
     trainer.hf_save_interval=100 \
     trainer.max_ckpts_to_keep=5 \
