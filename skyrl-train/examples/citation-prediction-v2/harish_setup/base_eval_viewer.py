@@ -291,10 +291,10 @@ def _split_think_text(segments: list[dict], text: str) -> None:
         segments.append({"type": "think" if in_think else "text", "content": part})
 
 
-def extract_question_from_prompt(input_prompt: str) -> tuple[str, str, str]:
-    """Extract summary, full user prompt, and system prompt from a decoded SkyRL prompt.
+def extract_question_from_prompt(input_prompt: str) -> tuple[str, str, str, str]:
+    """Extract summary, full user prompt, system prompt, and query from a decoded SkyRL prompt.
 
-    Returns (summary_line, full_user_prompt, system_prompt).
+    Returns (summary_line, full_user_prompt, system_prompt, query).
     """
     # Extract system prompt
     sys_match = re.search(r"<\|im_start\|>system\n(.*?)<\|im_end\|>", input_prompt, re.DOTALL)
@@ -310,8 +310,18 @@ def extract_question_from_prompt(input_prompt: str) -> tuple[str, str, str]:
             summary = f"{title_match.group(1).strip()} -> [{heading_match.group(1).strip()}]"
         else:
             summary = text[:300]
-        return summary, text, system_prompt
-    return input_prompt[-300:], input_prompt, system_prompt
+
+        # Extract the rich query (last paragraph before "Citation budget:")
+        query = ""
+        query_match = re.search(
+            r".*\n\n(.+?)\n\nCitation budget:",
+            text, re.DOTALL,
+        )
+        if query_match:
+            query = query_match.group(1).strip()
+
+        return summary, text, system_prompt, query
+    return input_prompt[-300:], input_prompt, system_prompt, ""
 
 
 def render_citation_html(raw_content: str, gt_set: set[str]) -> str:
@@ -334,7 +344,7 @@ def render_trajectory_html(input_prompt: str, output_response: str,
                            metrics: dict = None,
                            label: str = "", extra_badges: list = None) -> str:
     """Render a v2 trajectory as styled HTML with citation highlighting."""
-    question, full_prompt, system_prompt = extract_question_from_prompt(input_prompt)
+    question, full_prompt, system_prompt, query = extract_question_from_prompt(input_prompt)
     segments = parse_trajectory(output_response)
     gt_set = {normalize_arxiv_id(t) for t in targets}
     gt_set.discard("")
@@ -371,10 +381,18 @@ def render_trajectory_html(input_prompt: str, output_response: str,
         else:
             targets_html.append(f'<span class="tv-target-missed">{html.escape(nid)}</span>')
 
+    # Query display (prominent at top)
+    query_html = ""
+    if query:
+        query_html = f'''<div style="background:#e7f5ff;border:1px solid #74c0fc;border-radius:8px;padding:12px 16px;margin-bottom:12px;">
+            <div style="font-weight:700;color:#1864ab!important;font-size:0.85em;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">Query</div>
+            <div style="color:#212529!important;font-size:1.05em;">{html.escape(query)}</div>
+        </div>'''
+
     parts.append(f"""
     <div class="tv-header">
         {label_html}
-        <div class="tv-question"><strong>Prompt:</strong> {html.escape(question)}</div>
+        {query_html}
         <div class="tv-meta">{badge_html}</div>
         <div class="tv-targets"><strong>Targets ({len(gt_set)}):</strong> {", ".join(targets_html)}</div>
         {"" if not system_prompt else '''<details style="margin-top:10px;">
@@ -447,16 +465,23 @@ def render_trajectory_html(input_prompt: str, output_response: str,
 # Sweep discovery & data loading (SkyRL JSONL format)
 # ---------------------------------------------------------------------------
 
-SWEEP_DIR_RE = re.compile(r"^([\w-]+)_m(\d+)_n(\d+)_k(\d+)$")
+SWEEP_DIR_RE = re.compile(r"^([\w-]+)_m(\d+)_n(\d+)_k(\d+)(?:_part\d+)?$")
 
 
 def discover_sweep_runs(evals_dir: str) -> list[dict]:
-    """Discover sweep results from the sweep/ subdirectory."""
+    """Discover sweep results from the sweep/ subdirectory.
+
+    Merges _part0/_part1/... directories into a single logical run by
+    collecting all their eval_dir paths together.
+    """
     sweep_dir = Path(evals_dir) / "sweep"
     if not sweep_dir.is_dir():
         return []
 
-    runs = []
+    # Group directories by config key (without _partN suffix)
+    config_parts: dict[str, list[Path]] = OrderedDict()
+    config_meta: dict[str, dict] = {}
+
     for entry in sorted(sweep_dir.iterdir()):
         if not entry.is_dir():
             continue
@@ -478,51 +503,79 @@ def discover_sweep_runs(evals_dir: str) -> list[dict]:
         n = int(match.group(3))
         k = int(match.group(4))
 
-        label = f"{prompt} m={m} n={n} k={k}"
+        # Strip _partN to get config key
+        config_key = f"{prompt}_m{m}_n{n}_k{k}"
+        if config_key not in config_parts:
+            config_parts[config_key] = []
+            config_meta[config_key] = {"prompt": prompt, "m": m, "n": n, "k": k}
+        config_parts[config_key].append(eval_dir)
+
+    runs = []
+    for config_key, eval_dirs in config_parts.items():
+        meta = config_meta[config_key]
+        label = f"{meta['prompt']} m={meta['m']} n={meta['n']} k={meta['k']}"
         runs.append({
             "label": label,
-            "prompt": prompt,
-            "m": m,
-            "n": n,
-            "k": k,
-            "path": eval_dir,
-            "dir_name": entry.name,
+            "prompt": meta["prompt"],
+            "m": meta["m"],
+            "n": meta["n"],
+            "k": meta["k"],
+            "path": eval_dirs,  # list of eval_dir paths (merged parts)
+            "dir_name": config_key,
         })
 
     return runs
 
 
-def load_sweep_data(eval_dir: Path) -> dict | None:
-    """Load trajectories, group by prompt, compute recall metrics."""
+def load_sweep_data(eval_dirs: list[Path] | Path) -> dict | None:
+    """Load trajectories, group by prompt, compute recall metrics.
+
+    eval_dirs can be a single Path or a list of Paths (merged parts).
+    """
+    if isinstance(eval_dirs, Path):
+        eval_dirs = [eval_dirs]
+
     trajectories = []
-    for f in sorted(eval_dir.glob("*.jsonl")):
-        if f.stem == "aggregated_results":
-            continue
-        try:
-            with open(f) as fh:
-                for line in fh:
-                    line = line.strip()
-                    if line:
-                        trajectories.append(json.loads(line))
-        except (json.JSONDecodeError, OSError):
-            continue
+    for eval_dir in eval_dirs:
+        for f in sorted(eval_dir.glob("*.jsonl")):
+            if f.stem == "aggregated_results":
+                continue
+            try:
+                with open(f) as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if line:
+                            trajectories.append(json.loads(line))
+            except (json.JSONDecodeError, OSError):
+                continue
 
     if not trajectories:
         return None
 
-    # Read aggregated results
+    # Read aggregated results (average across parts)
     aggregated = {}
-    agg_file = eval_dir / "aggregated_results.jsonl"
-    if agg_file.exists():
-        try:
-            with open(agg_file) as fh:
-                for line in fh:
-                    line = line.strip()
-                    if line:
-                        aggregated = json.loads(line)
-                        break
-        except (json.JSONDecodeError, OSError):
-            pass
+    agg_results = []
+    for eval_dir in eval_dirs:
+        agg_file = eval_dir / "aggregated_results.jsonl"
+        if agg_file.exists():
+            try:
+                with open(agg_file) as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if line:
+                            agg_results.append(json.loads(line))
+                            break
+            except (json.JSONDecodeError, OSError):
+                pass
+    if agg_results:
+        # Average numeric values across parts
+        all_keys = set()
+        for ar in agg_results:
+            all_keys.update(ar.keys())
+        for key in all_keys:
+            vals = [ar[key] for ar in agg_results if key in ar and isinstance(ar[key], (int, float))]
+            if vals:
+                aggregated[key] = sum(vals) / len(vals)
 
     # Group trajectories by input_prompt
     prompt_groups = OrderedDict()
@@ -704,6 +757,59 @@ def build_best_of_k_plot(sweep_runs: list[dict], sweep_data_cache: dict,
     return tmp.name
 
 
+def build_recall_distribution_plot(sweep_runs: list[dict], sweep_data_cache: dict,
+                                   selected_labels: list[str]) -> str | None:
+    """Generate a Best-of-20 recall distribution histogram for selected setups."""
+    if not HAS_MATPLOTLIB or not selected_labels:
+        return None
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    bins = [0, 0.01, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.01]
+    bin_labels = ["0%", "(0,10]", "(10,20]", "(20,30]", "(30,40]",
+                  "(40,50]", "(50,60]", "(60,70]", "(70,80]", "(80,90]", "(90,100]"]
+
+    import numpy as np
+    n_setups = len(selected_labels)
+    width = 0.8 / n_setups
+    x = np.arange(len(bin_labels))
+
+    for i, label in enumerate(selected_labels):
+        run = next((r for r in sweep_runs if r["label"] == label), None)
+        if run is None:
+            continue
+        data = sweep_data_cache.get(run["dir_name"])
+        if data is None:
+            continue
+
+        best_recalls = [p["best_recall"] for p in data["prompts"]]
+        counts, _ = np.histogram(best_recalls, bins=bins)
+        fracs = counts / len(best_recalls) * 100
+
+        offset = (i - n_setups / 2 + 0.5) * width
+        bars = ax.bar(x + offset, fracs, width, label=label, alpha=0.8)
+
+        # Add count labels on bars
+        for bar, count in zip(bars, counts):
+            if count > 0:
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                        str(int(count)), ha='center', va='bottom', fontsize=8)
+
+    ax.set_xlabel("Best-of-20 Recall", fontsize=12)
+    ax.set_ylabel("% of Prompts", fontsize=12)
+    ax.set_title("Best-of-20 Recall Distribution by Prompt", fontsize=14)
+    ax.set_xticks(x)
+    ax.set_xticklabels(bin_labels, rotation=45, ha='right')
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3, axis='y')
+
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    fig.savefig(tmp.name, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    return tmp.name
+
+
 def build_metrics_table(sweep_runs: list[dict], sweep_data_cache: dict,
                         selected_labels: list[str]) -> str:
     """Build HTML table of recall metrics for selected setups."""
@@ -792,8 +898,8 @@ def create_app(evals_dir: str) -> gr.Blocks:
 
     METRIC_CHOICES = ["mean_best_recall", "mean_recall_1", "frac_any_nonzero"]
 
-    with gr.Blocks(title="Citation Prediction v2 — Eval Viewer") as app:
-        gr.Markdown("# Citation Prediction v2 — Eval Viewer")
+    with gr.Blocks(title="Citation Prediction v3 — Eval Viewer") as app:
+        gr.Markdown("# Citation Prediction v3 — Eval Viewer")
         gr.Markdown("Recall-based evaluation: predict all citations in a Related Work subsection.")
 
         with gr.Tabs():
@@ -882,7 +988,37 @@ def create_app(evals_dir: str) -> gr.Blocks:
                 app.load(fn=on_curve_update, inputs=[curve_select, curve_type_dd], outputs=[curve_plot, curve_table])
 
             # ================================================================
-            # Tab 3: Browse Trajectories
+            # Tab 3: Recall Distribution
+            # ================================================================
+            with gr.Tab("Recall Distribution"):
+                with gr.Row():
+                    dist_refresh = gr.Button("Refresh", variant="secondary", scale=1)
+                    dist_select = gr.CheckboxGroup(
+                        choices=initial_labels,
+                        value=initial_labels[:4],
+                        label="Select setups to compare",
+                    )
+
+                dist_plot = gr.Image(label="Best-of-20 Recall Distribution", type="filepath")
+
+                def on_dist_refresh():
+                    refresh_sweep()
+                    labels = get_sweep_labels()
+                    selected = labels[:4]
+                    plot_path = build_recall_distribution_plot(sweep_runs, sweep_data_cache, selected)
+                    return gr.update(choices=labels, value=selected), plot_path
+
+                def on_dist_update(selected):
+                    if not selected:
+                        return None
+                    return build_recall_distribution_plot(sweep_runs, sweep_data_cache, selected)
+
+                dist_refresh.click(fn=on_dist_refresh, outputs=[dist_select, dist_plot])
+                dist_select.change(fn=on_dist_update, inputs=[dist_select], outputs=[dist_plot])
+                app.load(fn=on_dist_update, inputs=[dist_select], outputs=[dist_plot])
+
+            # ================================================================
+            # Tab 4: Browse Trajectories
             # ================================================================
             with gr.Tab("Browse"):
                 with gr.Row():
@@ -1073,7 +1209,7 @@ def create_app(evals_dir: str) -> gr.Blocks:
                 )
 
             # ================================================================
-            # Tab 4: Summary Table
+            # Tab 5: Summary Table
             # ================================================================
             with gr.Tab("Summary"):
                 summary_refresh = gr.Button("Refresh", variant="secondary")
@@ -1132,7 +1268,7 @@ def create_app(evals_dir: str) -> gr.Blocks:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Citation Prediction v2 — Eval Viewer")
+    parser = argparse.ArgumentParser(description="Citation Prediction v3 — Eval Viewer")
     parser.add_argument(
         "--evals-dir",
         default=DEFAULT_EVALS_DIR,
