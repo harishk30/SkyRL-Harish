@@ -45,6 +45,7 @@ dependencies = [
     "uvicorn",
     "pybind11",
     "setuptools",
+    "google-genai>=1.63.0",
 ]
 
 [tool.uv]

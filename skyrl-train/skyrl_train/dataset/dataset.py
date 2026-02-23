@@ -1,4 +1,5 @@
 import datasets
+import json
 from loguru import logger
 import os
 from typing import List
@@ -69,6 +70,8 @@ class PromptDataset:
     def __getitem__(self, item):
         row_dict: dict = self.dataframe[item]
         messages = row_dict.pop(self.prompt_key)
+        if isinstance(messages, str):
+            messages = json.loads(messages)
         env_class = row_dict.pop(self.env_class_key, None)
 
         extra = {key: value for key, value in row_dict.items() if key != self.prompt_key and key != self.env_class_key}

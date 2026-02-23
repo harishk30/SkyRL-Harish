@@ -17,6 +17,8 @@ from omegaconf import DictConfig, OmegaConf
 
 from skyrl_gym.envs.search.env import SearchEnvConfig
 from skyrl_gym.envs.sql.env import Text2SQLEnvConfig
+from skyrl_gym.envs.citation_prediction.env import CitationPredictionEnvConfig
+from skyrl_gym.envs.citation_prediction_v2.env import CitationPredictionV2EnvConfig
 
 # ---------------------------------------------------------------------------
 # Data
@@ -187,6 +189,7 @@ class PolicyConfig(BaseConfig):
     fsdp_config: FSDPConfig = field(default_factory=FSDPConfig)
     sequence_parallel_size: int = 1
     use_torch_compile: bool = False
+    use_liger_kernel: bool = False
     record_memory: bool = False
     megatron_config: MegatronConfig = field(default_factory=MegatronConfig)
     model_config_kwargs: dict = field(default_factory=dict)
@@ -207,6 +210,7 @@ class RefConfig(BaseConfig):
     model: ModelConfig = field(default_factory=lambda: copy.deepcopy(ModelConfig(path="Qwen/Qwen2.5-1.5B-Instruct")))
     sequence_parallel_size: int = 1
     fsdp_config: FSDPConfig = field(default_factory=FSDPConfig)
+    use_liger_kernel: bool = False
     megatron_config: MegatronConfig = field(default_factory=MegatronConfig)
     model_config_kwargs: dict = field(default_factory=dict)
 
@@ -412,6 +416,8 @@ class SkyRLGymConfig(BaseConfig):
     text2sql: Text2SQLEnvConfig = field(default_factory=Text2SQLEnvConfig)
     llm_as_a_judge: GSM8kLLMJudgeEnvConfig = field(default_factory=GSM8kLLMJudgeEnvConfig)
     search: SearchEnvConfig = field(default_factory=SearchEnvConfig)
+    citation_prediction: CitationPredictionEnvConfig = field(default_factory=CitationPredictionEnvConfig)
+    citation_prediction_v2: CitationPredictionV2EnvConfig = field(default_factory=CitationPredictionV2EnvConfig)
 
 
 @dataclass
