@@ -25,6 +25,7 @@ def call_search_api(
     timeout: int = DEFAULT_TIMEOUT,
     log_requests: bool = True,
     session: Optional[requests.Session] = None,
+    max_date: Optional[int] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
     Calls the search API with a single query.
@@ -37,6 +38,7 @@ def call_search_api(
         timeout: The timeout for the request.
         log_requests: Whether to log requests.
         session: The session to use for the request. If none is provided, a new session will be created.
+        max_date: Optional YYMM cutoff for temporal filtering. Papers after this date are excluded.
 
     Returns:
         response: The response from the search API (json if successful, None otherwise)
@@ -46,6 +48,8 @@ def call_search_api(
     log_prefix = f"[Search Request ID: {request_id}] "
 
     payload = {"query": query, "topk": topk, "return_scores": return_scores}
+    if max_date is not None:
+        payload["max_date"] = max_date
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
 
     # Use provided session or create a new one for this request

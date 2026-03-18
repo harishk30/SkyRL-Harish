@@ -1,3 +1,4 @@
+import json
 import os
 from typing import List
 
@@ -58,9 +59,15 @@ class PromptDataset:
         # filter out too long prompts
         tokenizer = self.tokenizer
         prompt_key = self.prompt_key
+
+        def _prompt_token_count(doc):
+            messages = doc[prompt_key]
+            if isinstance(messages, str):
+                messages = json.loads(messages)
+            return len(tokenizer.apply_chat_template(messages, add_generation_prompt=True)) <= self.max_prompt_length
+
         self.dataframe = self.dataframe.filter(
-            lambda doc: len(tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True))
-            <= self.max_prompt_length,
+            _prompt_token_count,
             num_proc=self.num_workers,
             desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
         )
@@ -70,6 +77,8 @@ class PromptDataset:
     def __getitem__(self, item):
         row_dict: dict = self.dataframe[item]
         messages = row_dict.pop(self.prompt_key)
+        if isinstance(messages, str):
+            messages = json.loads(messages)
         env_class = row_dict.pop(self.env_class_key, None)
 
         extra = {key: value for key, value in row_dict.items() if key != self.prompt_key and key != self.env_class_key}

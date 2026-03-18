@@ -204,6 +204,8 @@ class PolicyConfig(BaseConfig):
     sequence_parallel_size: int = 1
     use_torch_compile: bool = False
     """Apply torch.compile to logits calculation."""
+    use_liger_kernel: bool = False
+    """Use Liger Kernel (fused Triton kernels) for model initialization."""
     record_memory: bool = False
     """Save memory snapshots to ``{ckpt_path}/memory_snapshots/``.
     Visualize by dragging pickle files to https://docs.pytorch.org/memory_viz."""
@@ -227,6 +229,8 @@ class CriticConfig(BaseConfig):
 class RefConfig(BaseConfig):
     model: ModelConfig = field(default_factory=ModelConfig)
     sequence_parallel_size: int = 1
+    use_liger_kernel: bool = False
+    """Use Liger Kernel (fused Triton kernels) for model initialization."""
     fsdp_config: FSDPConfig = field(default_factory=FSDPConfig)
     megatron_config: MegatronConfig = field(default_factory=MegatronConfig)
     model_config_kwargs: dict = field(default_factory=dict)

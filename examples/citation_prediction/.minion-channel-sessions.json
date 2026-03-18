@@ -1,0 +1,42 @@
+{
+  "1470988505558548637": {
+    "channelId": "1470988505558548637",
+    "sessionToken": "0E43CDF4",
+    "userId": "284488012514197515",
+    "terminalId": "fa14b27d-8a18-4f7b-8151-ea833169afe9",
+    "mcpPort": 9100,
+    "createdAt": "2026-02-11T03:43:21.288Z"
+  },
+  "1470995719140937889": {
+    "channelId": "1470995719140937889",
+    "sessionToken": "0E43CDF4",
+    "userId": "284488012514197515",
+    "terminalId": "dbb2b46c-f5fc-463d-bd80-bc24df6127e1",
+    "mcpPort": 9116,
+    "createdAt": "2026-02-11T20:14:31.784Z"
+  },
+  "1471133328370434068": {
+    "channelId": "1471133328370434068",
+    "sessionToken": "0E43CDF4",
+    "userId": "284488012514197515",
+    "terminalId": "a1cca282-4f25-4f59-a334-ab366dbbb308",
+    "mcpPort": 9115,
+    "createdAt": "2026-02-11T19:07:29.185Z"
+  },
+  "1471951847920238613": {
+    "channelId": "1471951847920238613",
+    "sessionToken": "0E43CDF4",
+    "userId": "284488012514197515",
+    "terminalId": "41e56269-b679-49b7-8950-2b8317766c69",
+    "mcpPort": 9119,
+    "createdAt": "2026-02-14T18:15:37.014Z"
+  },
+  "1472974926226128988": {
+    "channelId": "1472974926226128988",
+    "sessionToken": "0E43CDF4",
+    "userId": "284488012514197515",
+    "terminalId": "",
+    "mcpPort": 9120,
+    "createdAt": "2026-02-16T15:16:34.536Z"
+  }
+}

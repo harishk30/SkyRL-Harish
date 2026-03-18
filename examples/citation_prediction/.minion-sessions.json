@@ -1,0 +1,16 @@
+{
+  "753BB449": {
+    "token": "753BB449",
+    "userId": "",
+    "dmChannelId": "",
+    "createdAt": "2026-02-11T03:41:47.672Z",
+    "workingDirectory": "/home/hk4638/SkyRL/skyrl-train/examples/citation_prediction"
+  },
+  "0E43CDF4": {
+    "token": "0E43CDF4",
+    "userId": "284488012514197515",
+    "dmChannelId": "1470988458976874506",
+    "createdAt": "2026-02-11T03:42:44.264Z",
+    "workingDirectory": "/home/hk4638/SkyRL/skyrl-train/examples/citation_prediction"
+  }
+}
