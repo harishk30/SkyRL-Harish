@@ -5,11 +5,10 @@
 # Verifies the full 4-node pipeline works before committing to a 24-hour run.
 # Uses minimal batch sizes and 1 epoch to complete quickly.
 #
-# 4 nodes x 4 GPUs = 16 GPUs:
+# 3 nodes x 4 GPUs = 12 GPUs:
 #   Node 0: Retriever (4 GPUs for FAISS sharding)
 #   Node 1: Training head (4 GPUs)
 #   Node 2: Training worker 1 (4 GPUs)
-#   Node 3: Training worker 2 (4 GPUs)
 #
 # Usage:
 #   sbatch smoke_test.slurm
@@ -20,12 +19,11 @@
 #SBATCH --error=/scratch/gpfs/ZHUANGL/hk4638/logs/cit-v3-smoke_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=hk4638@princeton.edu
-#SBATCH --nodes=4
+#SBATCH --nodes=3
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
-#SBATCH --mem=512G
+#SBATCH --mem=256G
 #SBATCH --gres=gpu:4
-#SBATCH --constraint=gpu80
 #SBATCH --time=01:00:00
 #SBATCH --partition=gpu-test
 
@@ -66,8 +64,8 @@ export PATH="$HOME/.local/bin:$PATH"
 
 export VIRTUAL_ENV="/home/hk4638/SkyRL/.venv"
 
-# Local path to cached model
-MODEL_PATH="/scratch/gpfs/ZHUANGL/hk4638/huggingface/hub/models--Qwen--Qwen3-30B-A3B/snapshots/ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
+# Local path to cached model (Qwen3-4B for smoke test)
+MODEL_PATH="/scratch/gpfs/ZHUANGL/hk4638/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c"
 
 module load proxy/default
 
@@ -84,6 +82,9 @@ export WANDB_INIT_TIMEOUT=300
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 unset RAY_RUNTIME_ENV_HOOK
 
+# Debug vLLM engine startup failure — dump all infra logs to stdout
+export SKYRL_DUMP_INFRA_LOG_TO_STDOUT=1
+
 # Load secrets
 ENV_FILE="/home/hk4638/SkyRL/examples/search/harish_setup/.env"
 if [ -f "${ENV_FILE}" ]; then
@@ -98,15 +99,13 @@ NODELIST=($(scontrol show hostnames ${SLURM_JOB_NODELIST}))
 RETRIEVER_NODE=${NODELIST[0]}
 HEAD_NODE=${NODELIST[1]}
 WORKER_NODE=${NODELIST[2]}
-WORKER_NODE_2=${NODELIST[3]}
 
 echo "Retriever node: ${RETRIEVER_NODE}"
 echo "Training head: ${HEAD_NODE}"
 echo "Training worker 1: ${WORKER_NODE}"
-echo "Training worker 2: ${WORKER_NODE_2}"
 
 # Bypass proxy for internal cluster traffic
-export NO_PROXY="localhost,127.0.0.1,${RETRIEVER_NODE},${HEAD_NODE},${WORKER_NODE},${WORKER_NODE_2}"
+export NO_PROXY="localhost,127.0.0.1,${RETRIEVER_NODE},${HEAD_NODE},${WORKER_NODE}"
 export no_proxy="$NO_PROXY"
 echo "NO_PROXY set to: $NO_PROXY"
 
@@ -228,27 +227,6 @@ srun --nodes=1 --ntasks=1 --nodelist=${WORKER_NODE} \
 RAY_WORKER_PID=$!
 sleep 15
 
-echo "Starting Ray worker 2 on ${WORKER_NODE_2}"
-srun --nodes=1 --ntasks=1 --nodelist=${WORKER_NODE_2} \
-    bash -c "cd /home/hk4638/SkyRL && \
-        export UV_CACHE_DIR=${SCRATCH_BASE}/uv_cache && \
-        export UV_LINK_MODE=copy && \
-        export VIRTUAL_ENV=/home/hk4638/SkyRL/.venv && \
-        export PATH=\$HOME/.local/bin:\$PATH && \
-        export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 && \
-        export http_proxy=${http_proxy} && \
-        export https_proxy=${https_proxy} && \
-        export HTTP_PROXY=${HTTP_PROXY} && \
-        export HTTPS_PROXY=${HTTPS_PROXY} && \
-        export NO_PROXY=${NO_PROXY} && \
-        export no_proxy=${no_proxy} && \
-        export WANDB_API_KEY=${WANDB_API_KEY} && \
-        export WANDB_INIT_TIMEOUT=300 && \
-        uv run --active --no-sync ray start --address=${HEAD_NODE_IP}:${RAY_PORT} --num-gpus=4 && \
-        sleep infinity" &
-RAY_WORKER_2_PID=$!
-sleep 15
-
 # Join Ray cluster from retriever node with 0 GPUs
 echo "Joining Ray cluster from ${RETRIEVER_NODE} with 0 GPUs"
 uv run --active --no-sync ray start --address=${HEAD_NODE_IP}:${RAY_PORT} --num-gpus=0
@@ -286,15 +264,15 @@ uv run --active --no-sync --extra fsdp -m skyrl.train.entrypoints.main_base \
     trainer.ref.fsdp_config.cpu_offload=true \
     trainer.gradient_checkpointing_use_reentrant=false \
     trainer.placement.policy_num_gpus_per_node=4 \
-    trainer.placement.policy_num_nodes=3 \
+    trainer.placement.policy_num_nodes=2 \
     trainer.placement.ref_num_gpus_per_node=4 \
-    trainer.placement.ref_num_nodes=3 \
-    generator.num_inference_engines=6 \
-    generator.inference_engine_tensor_parallel_size=2 \
-    generator.backend=vllm \
-    generator.run_engines_locally=true \
-    generator.weight_sync_backend=nccl \
-    generator.gpu_memory_utilization=0.9 \
+    trainer.placement.ref_num_nodes=2 \
+    generator.inference_engine.num_engines=4 \
+    generator.inference_engine.tensor_parallel_size=2 \
+    generator.inference_engine.backend=vllm \
+    generator.inference_engine.run_engines_locally=true \
+    generator.inference_engine.weight_sync_backend=nccl \
+    generator.inference_engine.gpu_memory_utilization=0.9 \
     trainer.epochs=1 \
     trainer.update_epochs_per_batch=1 \
     trainer.train_batch_size=16 \
@@ -304,7 +282,7 @@ uv run --active --no-sync --extra fsdp -m skyrl.train.entrypoints.main_base \
     trainer.max_prompt_length=4096 \
     generator.max_input_length=32768 \
     generator.sampling_params.max_generate_length=1024 \
-    generator.async_engine=true \
+    generator.inference_engine.async_engine=true \
     generator.batched=false \
     generator.use_conversation_multi_turn=false \
     generator.n_samples_per_prompt=2 \
@@ -338,11 +316,9 @@ echo "=== Cleaning up ==="
 uv run --active --no-sync ray stop || true
 kill ${RAY_HEAD_PID} 2>/dev/null || true
 kill ${RAY_WORKER_PID} 2>/dev/null || true
-kill ${RAY_WORKER_2_PID} 2>/dev/null || true
 kill ${RETRIEVER_PID} 2>/dev/null || true
 wait ${RAY_HEAD_PID} 2>/dev/null || true
 wait ${RAY_WORKER_PID} 2>/dev/null || true
-wait ${RAY_WORKER_2_PID} 2>/dev/null || true
 
 echo "=== SMOKE TEST COMPLETE ==="
 echo "Exit code: ${TRAINING_EXIT_CODE}"

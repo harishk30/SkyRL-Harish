@@ -102,6 +102,11 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
             # https://github.com/vllm-project/vllm/blob/effc5d24fae10b29996256eb7a88668ff7941aed/examples/offline_inference/reproduciblity.py#L11
             os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
+        # Workaround: Ray's worker_process_setup_hook sets __RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR
+        # in the process env. vLLM 0.16's engine core subprocess inherits it, and Ray's internal
+        # validation rejects the duplicate. Unsetting it here prevents the conflict.
+        os.environ.pop("__RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR", None)
+
         # Store common attributes
         self._tp_size = kwargs.get("tensor_parallel_size", 1)
         self._pp_size = kwargs.get("pipeline_parallel_size", 1)

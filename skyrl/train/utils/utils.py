@@ -745,12 +745,20 @@ def initialize_ray(cfg: SkyRLTrainConfig):
         # Pass log file path to workers so they can redirect their output
         env_vars["SKYRL_LOG_FILE"] = log_file
 
+    # Set multiprocessing start method to 'spawn' before ray.init() to avoid forking
+    # within Ray workers. This replaces worker_process_setup_hook which conflicts with
+    # vLLM 0.16's engine core subprocess doing its own ray.init().
+    import multiprocessing
+    try:
+        multiprocessing.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
+
     # log_to_driver=True allows training progress from skyrl_entrypoint to reach stdout.
     # Infrastructure logs (vLLM, workers) are redirected to log file via os.dup2 in their init.
     ray.init(
         runtime_env={
             "env_vars": env_vars,
-            "worker_process_setup_hook": "skyrl.utils.worker_setup.worker_setup_fn",
         },
         log_to_driver=True,
     )

@@ -16,6 +16,8 @@ from typing import Annotated, Any, Dict, List, Optional, Type, TypeVar, Union
 import yaml
 from omegaconf import DictConfig, OmegaConf
 
+from skyrl_gym.envs.citation_prediction.env import CitationPredictionEnvConfig
+from skyrl_gym.envs.citation_prediction_v2.env import CitationPredictionV2EnvConfig
 from skyrl_gym.envs.search.env import SearchEnvConfig
 from skyrl_gym.envs.sql.env import Text2SQLEnvConfig
 
@@ -548,6 +550,8 @@ class SkyRLGymConfig(BaseConfig):
     text2sql: Text2SQLEnvConfig = field(default_factory=Text2SQLEnvConfig)
     llm_as_a_judge: GSM8kLLMJudgeEnvConfig = field(default_factory=GSM8kLLMJudgeEnvConfig)
     search: SearchEnvConfig = field(default_factory=SearchEnvConfig)
+    citation_prediction: CitationPredictionEnvConfig = field(default_factory=CitationPredictionEnvConfig)
+    citation_prediction_v2: CitationPredictionV2EnvConfig = field(default_factory=CitationPredictionV2EnvConfig)
 
 
 @dataclass

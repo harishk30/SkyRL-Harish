@@ -340,12 +340,12 @@ uv run --active --no-sync --extra megatron -m skyrl.train.entrypoints.main_base 
     trainer.placement.policy_num_nodes=4 \
     trainer.placement.ref_num_gpus_per_node=4 \
     trainer.placement.ref_num_nodes=4 \
-    generator.num_inference_engines=$NUM_INFERENCE_ENGINES \
-    generator.inference_engine_tensor_parallel_size=$INFERENCE_ENGINE_TP \
-    generator.backend=vllm \
-    generator.run_engines_locally=true \
-    generator.weight_sync_backend=nccl \
-    generator.gpu_memory_utilization=0.6 \
+    generator.inference_engine.num_engines=$NUM_INFERENCE_ENGINES \
+    generator.inference_engine.tensor_parallel_size=$INFERENCE_ENGINE_TP \
+    generator.inference_engine.backend=vllm \
+    generator.inference_engine.run_engines_locally=true \
+    generator.inference_engine.weight_sync_backend=nccl \
+    generator.inference_engine.gpu_memory_utilization=0.6 \
     trainer.epochs=1 \
     trainer.update_epochs_per_batch=1 \
     trainer.train_batch_size=12 \
@@ -355,7 +355,7 @@ uv run --active --no-sync --extra megatron -m skyrl.train.entrypoints.main_base 
     trainer.max_prompt_length=4096 \
     generator.max_input_length=32768 \
     generator.sampling_params.max_generate_length=1024 \
-    generator.async_engine=true \
+    generator.inference_engine.async_engine=true \
     generator.batched=false \
     generator.use_conversation_multi_turn=false \
     generator.n_samples_per_prompt=2 \
