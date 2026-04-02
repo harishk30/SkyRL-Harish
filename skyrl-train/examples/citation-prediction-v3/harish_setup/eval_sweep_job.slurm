@@ -18,6 +18,11 @@
 #   EMBEDDING_MODEL  qwen3_4b | qwen3_06b (default: qwen3_4b)
 #   MAX_EXAMPLES     Number of prompts to evaluate (default: 100)
 #   PROMPT_VARIANT   with_intro | no_intro (default: with_intro)
+#   MODEL_PATH_OVERRIDE  Explicit HF/vLLM model directory to evaluate
+#   DIR_PREFIX_OVERRIDE  Output/run-name prefix when using a custom model path
+#   MAX_INPUT_LENGTH_OVERRIDE  Explicit generator.max_input_length
+#   MAX_GEN_LENGTH_OVERRIDE    Explicit generator.sampling_params.max_generate_length
+#   MAX_PROMPT_LENGTH_OVERRIDE Explicit trainer.max_prompt_length
 #
 # Usage:
 #   MAX_TURNS=4 TOPK=3 sbatch eval_sweep_job.slurm
@@ -65,9 +70,16 @@ EMBEDDING_MODEL=${EMBEDDING_MODEL:-"qwen3_4b"}
 MAX_EXAMPLES=${MAX_EXAMPLES:-100}
 MODEL_NAME=${MODEL_NAME:-"qwen3_4b"}
 PROMPT_VARIANT=${PROMPT_VARIANT:-"with_intro"}
+MODEL_PATH_OVERRIDE=${MODEL_PATH_OVERRIDE:-""}
+DIR_PREFIX_OVERRIDE=${DIR_PREFIX_OVERRIDE:-""}
+MAX_INPUT_LENGTH_OVERRIDE=${MAX_INPUT_LENGTH_OVERRIDE:-""}
+MAX_GEN_LENGTH_OVERRIDE=${MAX_GEN_LENGTH_OVERRIDE:-""}
+MAX_PROMPT_LENGTH_OVERRIDE=${MAX_PROMPT_LENGTH_OVERRIDE:-""}
 
 # Output directory
-if [ "$MODEL_NAME" = "qwen3_4b_thinking" ]; then
+if [ -n "$DIR_PREFIX_OVERRIDE" ]; then
+    DIR_PREFIX="${DIR_PREFIX_OVERRIDE}"
+elif [ "$MODEL_NAME" = "qwen3_4b_thinking" ]; then
     DIR_PREFIX="v3-thinking"
 elif [ "$MODEL_NAME" = "qwen3_4b_yarn" ]; then
     DIR_PREFIX="v3-yarn"
@@ -114,7 +126,12 @@ export PATH="$HOME/.local/bin:$PATH"
 export VIRTUAL_ENV="/home/hk4638/SkyRL/skyrl-train/.venv"
 
 # Model selection
-if [ "$MODEL_NAME" = "qwen3_4b_thinking" ]; then
+if [ -n "$MODEL_PATH_OVERRIDE" ]; then
+    MODEL_PATH="${MODEL_PATH_OVERRIDE}"
+    MAX_INPUT_LENGTH=32000
+    MAX_GEN_LENGTH=1024
+    ROPE_SCALING=""
+elif [ "$MODEL_NAME" = "qwen3_4b_thinking" ]; then
     MODEL_PATH="/scratch/gpfs/ZHUANGL/hk4638/huggingface/hub/models--Qwen--Qwen3-4B-Thinking-2507/snapshots/768f209d9ea81521153ed38c47d515654e938aea"
     MAX_INPUT_LENGTH=163840
     MAX_GEN_LENGTH=8192
@@ -134,6 +151,14 @@ else
     MAX_INPUT_LENGTH=32000
     MAX_GEN_LENGTH=1024
     ROPE_SCALING=""
+fi
+
+if [ -n "$MAX_INPUT_LENGTH_OVERRIDE" ]; then
+    MAX_INPUT_LENGTH="${MAX_INPUT_LENGTH_OVERRIDE}"
+fi
+
+if [ -n "$MAX_GEN_LENGTH_OVERRIDE" ]; then
+    MAX_GEN_LENGTH="${MAX_GEN_LENGTH_OVERRIDE}"
 fi
 
 module load proxy/default
@@ -273,6 +298,10 @@ else
     MAX_PROMPT_LENGTH=4096
 fi
 
+if [ -n "$MAX_PROMPT_LENGTH_OVERRIDE" ]; then
+    MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH_OVERRIDE}"
+fi
+
 srun --nodes=1 --ntasks=1 --nodelist=${EVAL_NODE} \
     /bin/bash -c "cd /home/hk4638/SkyRL/skyrl-train && \
         export HOME=/home/hk4638 && \
@@ -293,11 +322,11 @@ srun --nodes=1 --ntasks=1 --nodelist=${EVAL_NODE} \
         export TRANSFORMERS_OFFLINE=1 && \
         export TRANSFORMERS_CACHE=${HF_HOME} && \
         echo 'Starting Ray head...' && \
-        uv run --active --frozen ray start --head --port=${RAY_PORT} --num-gpus=4 && \
+        uv run --active --no-sync ray start --head --port=${RAY_PORT} --num-gpus=4 && \
         sleep 3 && \
         export RAY_ADDRESS=127.0.0.1:${RAY_PORT} && \
         echo 'Ray started, launching eval...' && \
-        uv run --active --frozen --extra vllm -m skyrl_train.entrypoints.main_generate \
+        uv run --active --no-sync --extra vllm -m skyrl_train.entrypoints.main_generate \
     data.val_data=\"['${DATA_FILE}']\" \
     trainer.policy.model.path=\"${MODEL_PATH}\" \
     +trainer.policy.use_liger_kernel=true \
@@ -340,11 +369,11 @@ EVAL_EXIT_CODE=$?
 # CLEANUP
 # ============================================================================
 echo "=== Cleaning up ==="
-uv run --active --frozen ray stop || true
+uv run --active --no-sync ray stop || true
 srun --nodes=1 --ntasks=1 --nodelist=${EVAL_NODE} \
     /bin/bash -c "export VIRTUAL_ENV=/home/hk4638/SkyRL/skyrl-train/.venv && \
         export PATH=/home/hk4638/.local/bin:\$PATH && \
-        uv run --active --frozen ray stop" 2>/dev/null || true
+        uv run --active --no-sync ray stop" 2>/dev/null || true
 kill ${RETRIEVER_PID} 2>/dev/null || true
 
 echo "=== Sweep eval complete ==="
